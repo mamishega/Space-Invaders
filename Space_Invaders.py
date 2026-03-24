@@ -6,6 +6,7 @@
 
 import threading
 import queue
+import argparse
 from collections import deque
 import pygame
 import pygame.sndarray
@@ -18,15 +19,53 @@ import time
 import sys
 
 # =============================================================================
+# ARGUMENT PARSING
+# Normalise --input before hailo_apps_infra reads sys.argv
+# =============================================================================
+def _parse_and_normalise_input():
+    """
+    Parse --input from the command line and normalise it so that:
+      /dev/video0  →  usb
+      /dev/video1  →  usb  (with device override stored separately)
+      usb          →  usb
+      rpi          →  rpi
+    Returns the normalised input string and the raw device path (or None).
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--input', '-i', default='usb')
+    args, _ = parser.parse_known_args()
+
+    raw = args.input.strip()
+    device_path = None
+
+    if raw.startswith('/dev/video'):
+        device_path = raw
+        # Rewrite sys.argv so hailo_apps_infra sees the expected keyword
+        for idx, val in enumerate(sys.argv):
+            if val == raw:
+                sys.argv[idx] = 'usb'
+                break
+        return 'usb', device_path
+
+    return raw, device_path
+
+INPUT_SOURCE, CAMERA_DEVICE = _parse_and_normalise_input()
+
+# =============================================================================
 # HAILO / GSTREAMER — optional import
 # If the Hailo environment is not active the game falls back to
 # keyboard + mouse control automatically.
 # =============================================================================
 HAILO_AVAILABLE = False
+_glib_loop       = None   # kept alive so GStreamer events are processed
+
 try:
     import gi
     gi.require_version('Gst', '1.0')
     from gi.repository import Gst, GLib
+
+    # Initialise GStreamer once, here, before anything else uses it
+    Gst.init(None)
 
     import hailo
     from hailo_apps_infra.hailo_rpi_common import (
@@ -35,6 +74,8 @@ try:
     from hailo_apps_infra.pose_estimation_pipeline import GStreamerPoseEstimationApp
     HAILO_AVAILABLE = True
     print("[INFO] Hailo AI HAT+ detected — pose estimation enabled.")
+    print(f"[INFO] Input source : {INPUT_SOURCE}"
+          + (f"  ({CAMERA_DEVICE})" if CAMERA_DEVICE else ""))
 
 except Exception as _hailo_err:
     print(f"[WARN] Hailo / hailo_apps_infra not found: {_hailo_err}")
@@ -42,7 +83,7 @@ except Exception as _hailo_err:
     print("[INFO] To enable Hailo:  source ~/hailo-rpi5-examples/setup_env.sh")
 
     # ------------------------------------------------------------------
-    # Minimal stub classes so the rest of the file imports without error
+    # Minimal stub classes so the rest of the file parses without error
     # ------------------------------------------------------------------
     class app_callback_class:          # noqa: N801
         pass
@@ -56,6 +97,35 @@ except Exception as _hailo_err:
     class Gst:
         class PadProbeReturn:
             OK = 0
+
+    class GLib:
+        class MainLoop:
+            def run(self): pass
+
+
+def _start_glib_loop():
+    """
+    GStreamer needs a running GLib main loop to dispatch pipeline bus
+    messages (EOS, errors, state changes).  Without it the camera
+    pipeline builds successfully but never delivers frames.
+    """
+    global _glib_loop
+    if not HAILO_AVAILABLE:
+        return
+    _glib_loop = GLib.MainLoop()
+    try:
+        _glib_loop.run()
+    except Exception as exc:
+        print(f"[WARN] GLib main loop exited: {exc}")
+
+
+def _check_camera_device(device: str) -> bool:
+    """Return True if the V4L2 device node exists and is accessible."""
+    if device and not os.path.exists(device):
+        print(f"[ERROR] Camera device not found: {device}")
+        print( "        Check: ls /dev/video*")
+        return False
+    return True
 
 # =============================================================================
 # CONSTANTS
@@ -564,14 +634,44 @@ def main():
     shake_timer      = 0
     last_tick_second = -1
 
-    # Start pose estimation thread (only when Hailo hardware is present)
+    # ------------------------------------------------------------------
+    # CAMERA + POSE ESTIMATION STARTUP
+    # ------------------------------------------------------------------
     user_data = PoseInvadersUserData()
+
     if HAILO_AVAILABLE:
-        callback    = PoseInvadersCallback(user_data)
-        app         = GStreamerPoseEstimationApp(callback, user_data)
-        pose_thread = threading.Thread(target=app.run, daemon=True)
-        pose_thread.start()
-        print("[INFO] Pose estimation thread started.")
+        # 1. Validate the camera device node exists
+        if CAMERA_DEVICE and not _check_camera_device(CAMERA_DEVICE):
+            print("[WARN] Camera device missing — switching to keyboard fallback.")
+            _hailo_ok = False
+        else:
+            _hailo_ok = True
+
+        if _hailo_ok:
+            # 2. GLib main loop — MUST start before app.run() so the
+            #    GStreamer pipeline bus has an event dispatcher ready
+            glib_thread = threading.Thread(
+                target=_start_glib_loop, daemon=True, name='GLib-Loop'
+            )
+            glib_thread.start()
+            time.sleep(0.1)   # give GLib loop time to spin up
+
+            # 3. Build and start the pose pipeline
+            def _run_pose_app():
+                try:
+                    callback = PoseInvadersCallback(user_data)
+                    app      = GStreamerPoseEstimationApp(callback, user_data)
+                    app.run()
+                except Exception as exc:
+                    print(f"[ERROR] Pose pipeline crashed: {exc}")
+                    print("[INFO]  Continuing in keyboard fallback mode.")
+
+            pose_thread = threading.Thread(
+                target=_run_pose_app, daemon=True, name='Pose-Pipeline'
+            )
+            pose_thread.start()
+            print("[INFO] Camera pipeline starting…  "
+                  "(first frame may take 2–3 s)")
     else:
         print("[INFO] Keyboard / mouse fallback active.")
         print("       P1: A / D keys    P2: LEFT / RIGHT keys")
@@ -833,6 +933,16 @@ def main():
 
         screen.fill(BLACK)
         screen.blit(game_surf, (sx, sy))
+
+        # Camera warm-up overlay — shown for the first 3 seconds
+        # when Hailo is active so players know the camera is starting
+        if HAILO_AVAILABLE and frame < FPS * 3:
+            _font_sm  = pygame.font.SysFont('monospace', 18, bold=True)
+            _cam_text = _font_sm.render(
+                f"Camera warming up… ({INPUT_SOURCE})", True, (255, 220, 60)
+            )
+            screen.blit(_cam_text, (10, WINDOW_HEIGHT - 30))
+
         pygame.display.flip()
         clock.tick(FPS)
         frame += 1
