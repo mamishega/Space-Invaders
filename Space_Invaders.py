@@ -20,79 +20,62 @@ import sys
 
 # =============================================================================
 # ARGUMENT PARSING
-# Normalise --input before hailo_apps_infra reads sys.argv
+# Normalise --input so /dev/video0 → 'usb' (hailo_apps_infra keyword)
 # =============================================================================
+
 def _parse_and_normalise_input():
-    """
-    Parse --input from the command line and normalise it so that:
-      /dev/video0  →  usb
-      /dev/video1  →  usb  (with device override stored separately)
-      usb          →  usb
-      rpi          →  rpi
-    Returns the normalised input string and the raw device path (or None).
-    """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--input', '-i', default='usb')
     args, _ = parser.parse_known_args()
-
     raw = args.input.strip()
-    device_path = None
-
     if raw.startswith('/dev/video'):
-        device_path = raw
-        # Rewrite sys.argv so hailo_apps_infra sees the expected keyword
         for idx, val in enumerate(sys.argv):
             if val == raw:
                 sys.argv[idx] = 'usb'
                 break
-        return 'usb', device_path
-
-    return raw, device_path
+        return 'usb', raw
+    return raw, None
 
 INPUT_SOURCE, CAMERA_DEVICE = _parse_and_normalise_input()
 
 # =============================================================================
 # HAILO / GSTREAMER — optional import
-# If the Hailo environment is not active the game falls back to
-# keyboard + mouse control automatically.
+# Falls back to keyboard control if Hailo env is not active.
 # =============================================================================
+
 HAILO_AVAILABLE = False
-_glib_loop       = None   # kept alive so GStreamer events are processed
+_glib_loop       = None
 
 try:
     import gi
     gi.require_version('Gst', '1.0')
     from gi.repository import Gst, GLib
-
-    # Initialise GStreamer once, here, before anything else uses it
     Gst.init(None)
 
     import hailo
     from hailo_apps_infra.hailo_rpi_common import (
-        get_caps_from_pad, get_numpy_from_buffer, app_callback_class
+        get_caps_from_pad, app_callback_class
     )
     from hailo_apps_infra.pose_estimation_pipeline import GStreamerPoseEstimationApp
+
     HAILO_AVAILABLE = True
     print("[INFO] Hailo AI HAT+ detected — pose estimation enabled.")
-    print(f"[INFO] Input source : {INPUT_SOURCE}"
-          + (f"  ({CAMERA_DEVICE})" if CAMERA_DEVICE else ""))
+    print(f"[INFO] Input : {INPUT_SOURCE}" + (f"  ({CAMERA_DEVICE})" if CAMERA_DEVICE else ""))
 
 except Exception as _hailo_err:
-    print(f"[WARN] Hailo / hailo_apps_infra not found: {_hailo_err}")
-    print("[INFO] Running in KEYBOARD / MOUSE fallback mode.")
+    print(f"[WARN] Hailo / hailo_apps_infra not available: {_hailo_err}")
+    print("[INFO] Running in KEYBOARD fallback mode.")
     print("[INFO] To enable Hailo:  source ~/hailo-rpi5-examples/setup_env.sh")
 
-    # ------------------------------------------------------------------
-    # Minimal stub classes so the rest of the file parses without error
-    # ------------------------------------------------------------------
-    class app_callback_class:          # noqa: N801
+    # Minimal stubs — keep the rest of the file parseable
+    class app_callback_class:
         pass
 
-    class _FakeGStreamerApp:
+    class _FakeApp:
         def run(self): pass
 
     def GStreamerPoseEstimationApp(cb, ud):
-        return _FakeGStreamerApp()
+        return _FakeApp()
 
     class Gst:
         class PadProbeReturn:
@@ -104,11 +87,7 @@ except Exception as _hailo_err:
 
 
 def _start_glib_loop():
-    """
-    GStreamer needs a running GLib main loop to dispatch pipeline bus
-    messages (EOS, errors, state changes).  Without it the camera
-    pipeline builds successfully but never delivers frames.
-    """
+    """GStreamer needs a running GLib loop to dispatch pipeline events."""
     global _glib_loop
     if not HAILO_AVAILABLE:
         return
@@ -116,44 +95,43 @@ def _start_glib_loop():
     try:
         _glib_loop.run()
     except Exception as exc:
-        print(f"[WARN] GLib main loop exited: {exc}")
+        print(f"[WARN] GLib loop exited: {exc}")
 
-
-def _check_camera_device(device: str) -> bool:
-    """Return True if the V4L2 device node exists and is accessible."""
-    if device and not os.path.exists(device):
-        print(f"[ERROR] Camera device not found: {device}")
-        print( "        Check: ls /dev/video*")
-        return False
-    return True
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
-# --- Window ---
 WINDOW_WIDTH  = 1280
 WINDOW_HEIGHT = 720
 FPS           = 60
 
-# --- Players ---
 MAX_PLAYERS      = 2
-SMOOTHING_WINDOW = 10       # frames of head-position smoothing
+SMOOTHING_WINDOW = 8        # frames of position smoothing (lower = more responsive)
+MIRROR_X         = True     # True = mirror camera so player's right → ship moves right
+
+# --- Pose keypoints (COCO-17 format) ---
+KP_NOSE           = 0
+KP_LEFT_SHOULDER  = 5
+KP_RIGHT_SHOULDER = 6
+KP_LEFT_HIP       = 11
+KP_RIGHT_HIP      = 12
+POSE_MIN_SCORE    = 0.4     # minimum landmark confidence to use
 
 # --- Ship ---
 SHIP_WIDTH  = 60
 SHIP_HEIGHT = 40
 
 # --- Bullets ---
-BULLET_SPEED         = 12
-BULLET_RADIUS        = 4
+BULLET_SPEED          = 12
+BULLET_RADIUS         = 4
 SHOOT_INTERVAL_FRAMES = 20
-BULLET_TRAIL_LEN     = 6
+BULLET_TRAIL_LEN      = 6
 
 # --- Enemies ---
-ENEMY_WIDTH  = 48
-ENEMY_HEIGHT = 40
-ENEMY_SPEED  = 1.5
+ENEMY_WIDTH        = 48
+ENEMY_HEIGHT       = 40
+ENEMY_SPEED        = 1.5
 ENEMY_SPAWN_CHANCE = 0.02
 ENEMY_DRIFT_SPEED  = 1.5
 
@@ -166,7 +144,7 @@ ENEMY_TYPES = [
 _ENEMY_TYPE_WEIGHTS = [t[3] for t in ENEMY_TYPES]
 
 # --- Round ---
-ROUND_TIME           = 60   # seconds per round
+ROUND_TIME = 60  # seconds
 
 # --- Banner / Fireworks ---
 FIREWORK_CHANCE      = 0.15
@@ -182,9 +160,9 @@ SHAKE_AMPLITUDE    = 8
 LOW_TIME_THRESHOLD = 10
 GHOST_ALPHA        = 60
 
-# --- Stars (3D background) ---
+# --- Stars ---
 NUM_STARS    = 180
-STAR_SPEED_Z = 0.015   # depth movement per frame
+STAR_SPEED_Z = 0.015
 FOV          = 300.0
 
 # --- Colours ---
@@ -205,18 +183,16 @@ SAMPLE_RATE = 44100
 BGM_VOLUME  = 0.35
 SFX_VOLUME  = 0.70
 
-# Set paths to real audio files, or leave None to use generated tones
 AUDIO_FILES = {
-    'shoot':     None,   # e.g. 'sounds/shoot.wav'
+    'shoot':     None,
     'explode_0': None,
     'explode_1': None,
     'explode_2': None,
     'round_end': None,
     'tick':      None,
-    'bgm':       None,   # .ogg recommended for looping
+    'bgm':       None,
 }
 
-# --- High score file ---
 HIGH_SCORE_FILE = os.path.join(os.path.dirname(__file__), '.highscore.json')
 
 
@@ -245,64 +221,160 @@ def save_high_score(score):
 # =============================================================================
 
 class PoseInvadersUserData(app_callback_class):
+    """
+    Thread-safe shared state between the GStreamer callback thread
+    and the main pygame game loop.
+
+    Ship position is stored as a normalised float 0.0–1.0 (fraction of
+    screen width).  The main loop scales to pixels.  This means the
+    camera resolution is completely decoupled from the game resolution.
+    """
+
     def __init__(self):
         super().__init__()
-        self.position_queues = [queue.Queue(maxsize=5) for _ in range(MAX_PLAYERS)]
-        self.active_players  = [False] * MAX_PLAYERS
+        # Normalised X positions (0.0 – 1.0) per player
+        self._position_queues = [queue.Queue(maxsize=5) for _ in range(MAX_PLAYERS)]
+        self._lock            = threading.Lock()
+        self._active          = [False] * MAX_PLAYERS
+        # Diagnostics visible in the HUD
+        self.detections_last_frame = 0
+        self.camera_fps            = 0.0
+        self._last_frame_time      = time.time()
 
-    def update_position(self, player_idx, x_norm):
+    # ---- position ----
+    def put_position(self, player_idx, x_norm):
+        """Push a normalised X position (0–1) for the given player."""
         try:
-            self.position_queues[player_idx].put_nowait(x_norm)
+            self._position_queues[player_idx].put_nowait(float(x_norm))
         except queue.Full:
             pass
 
+    def get_position(self, player_idx):
+        """Pop the latest position; returns None if no new data."""
+        try:
+            return self._position_queues[player_idx].get_nowait()
+        except queue.Empty:
+            return None
+
+    # ---- active flags ----
+    def set_active(self, player_idx, state: bool):
+        with self._lock:
+            self._active[player_idx] = state
+
+    def set_all_active(self, states):
+        with self._lock:
+            self._active = list(states)
+
+    @property
+    def active_players(self):
+        with self._lock:
+            return list(self._active)
+
+    # ---- camera FPS bookkeeping ----
+    def tick_frame(self, n_detections: int):
+        now = time.time()
+        dt  = now - self._last_frame_time
+        if dt > 0:
+            self.camera_fps = round(1.0 / dt, 1)
+        self._last_frame_time      = now
+        self.detections_last_frame = n_detections
+
 
 class PoseInvadersCallback(app_callback_class):
-    # Wrist keypoint indices in COCO17 pose format
-    LEFT_WRIST  = 9
-    RIGHT_WRIST = 10
+    """
+    GStreamer pad probe callback.
 
-    def __init__(self, user_data):
+    Extracts horizontal body position from Hailo pose detections and
+    pushes normalised (0–1) X coordinates into PoseInvadersUserData.
+
+    Control point priority (most stable → least):
+      1. Mid-hip  (KP_LEFT_HIP + KP_RIGHT_HIP averaged)
+      2. Mid-shoulder (KP_LEFT_SHOULDER + KP_RIGHT_SHOULDER averaged)
+      3. Nose     (KP_NOSE)
+    """
+
+    def __init__(self, user_data: PoseInvadersUserData):
         super().__init__()
         self.user_data = user_data
 
-    def __call__(self, pad, info, u_data):
+    # ------------------------------------------------------------------
+    def _best_x_norm(self, pts, bbox) -> float | None:
+        """
+        Return the best normalised X (0–1 in camera frame, already bbox-
+        expanded to full-frame coordinates) from available keypoints.
+        Returns None if no reliable point found.
+        """
+        def kp_ok(idx):
+            if idx >= len(pts):
+                return False
+            pt = pts[idx]
+            # hailo landmark points expose a score via .score()
+            try:
+                return pt.score() >= POSE_MIN_SCORE
+            except Exception:
+                return True   # older SDK versions have no score — accept all
+
+        def kp_x(idx):
+            """Convert landmark relative-to-bbox to full-frame normalised X."""
+            pt = pts[idx]
+            return pt.x() * bbox.width() + bbox.xmin()
+
+        # 1. Mid-hip
+        if kp_ok(KP_LEFT_HIP) and kp_ok(KP_RIGHT_HIP):
+            return (kp_x(KP_LEFT_HIP) + kp_x(KP_RIGHT_HIP)) / 2.0
+
+        # 2. Mid-shoulder
+        if kp_ok(KP_LEFT_SHOULDER) and kp_ok(KP_RIGHT_SHOULDER):
+            return (kp_x(KP_LEFT_SHOULDER) + kp_x(KP_RIGHT_SHOULDER)) / 2.0
+
+        # 3. Nose
+        if kp_ok(KP_NOSE):
+            return kp_x(KP_NOSE)
+
+        return None
+
+    # ------------------------------------------------------------------
+    def __call__(self, pad, info, _u_data):
         if not HAILO_AVAILABLE:
             return Gst.PadProbeReturn.OK
 
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
-        caps   = get_caps_from_pad(pad)
-        frame  = get_numpy_from_buffer(buffer, caps)
-        if frame is None:
-            return Gst.PadProbeReturn.OK
 
-        h, w = frame.shape[:2]
         roi  = hailo.get_roi_from_buffer(buffer)
         dets = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-        active = [False] * MAX_PLAYERS
-        player_xs = []
+        positions = []   # list of (x_norm_0_to_1,)
 
         for det in dets:
+            if det.get_label() not in ('person', ''):
+                continue
             lms = det.get_objects_typed(hailo.HAILO_LANDMARKS)
             if not lms:
                 continue
-            pts = lms[0].get_points()
-            if len(pts) <= max(self.LEFT_WRIST, self.RIGHT_WRIST):
+            pts  = lms[0].get_points()
+            bbox = det.get_bbox()
+            xn   = self._best_x_norm(pts, bbox)
+            if xn is None:
                 continue
-            lw = pts[self.LEFT_WRIST]
-            rw = pts[self.RIGHT_WRIST]
-            cx = ((lw.x() + rw.x()) / 2) * w
-            player_xs.append(cx)
+            positions.append(xn)
 
-        player_xs.sort()
-        for idx, px in enumerate(player_xs[:MAX_PLAYERS]):
-            active[idx] = True
-            self.user_data.update_position(idx, px)
+        # Sort left-to-right so P1 is always the left-most person.
+        # Mirror if needed (camera shows mirror image by default).
+        positions.sort()
+        if MIRROR_X:
+            positions = [1.0 - x for x in reversed(positions)]
 
-        self.user_data.active_players = active
+        # Push positions + mark active flags
+        new_active = [False] * MAX_PLAYERS
+        for idx, xn in enumerate(positions[:MAX_PLAYERS]):
+            self.user_data.put_position(idx, xn)
+            new_active[idx] = True
+
+        self.user_data.set_all_active(new_active)
+        self.user_data.tick_frame(len(positions))
+
         return Gst.PadProbeReturn.OK
 
 
@@ -331,7 +403,6 @@ def _make_tone(freq, duration_ms, volume=0.5, wave='square'):
 
 def _make_sweep(f0, f1, duration_ms, volume=0.5, wave='sine'):
     n     = int(SAMPLE_RATE * duration_ms / 1000)
-    t     = np.linspace(0, duration_ms / 1000, n, False)
     freq  = np.linspace(f0, f1, n)
     phase = np.cumsum(2 * np.pi * freq / SAMPLE_RATE)
     sig   = np.sin(phase) if wave == 'sine' else np.sign(np.sin(phase))
@@ -385,26 +456,19 @@ def start_bgm():
 
 def generate_stars_3d():
     cx, cy = WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2
-    stars  = []
-    for _ in range(NUM_STARS):
-        x = random.uniform(-cx, cx)
-        y = random.uniform(-cy, cy)
-        z = random.uniform(0.1, 1.0)
-        stars.append([x, y, z])
-    return stars
+    return [[random.uniform(-cx, cx), random.uniform(-cy, cy), random.uniform(0.1, 1.0)]
+            for _ in range(NUM_STARS)]
 
 
 def draw_background_3d(surf, stars):
     surf.fill((5, 5, 18))
     cx, cy = WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2
     for star in stars:
-        # Move toward viewer
         star[2] -= STAR_SPEED_Z
         if star[2] <= 0:
             star[0] = random.uniform(-cx, cx)
             star[1] = random.uniform(-cy, cy)
             star[2] = 1.0
-
         sx = int(cx + star[0] / star[2])
         sy = int(cy + star[1] / star[2])
         if 0 <= sx < WINDOW_WIDTH and 0 <= sy < WINDOW_HEIGHT:
@@ -428,31 +492,26 @@ def draw_text(surf, text, x, y, color=WHITE, size=28):
 
 
 def draw_ship(surf, x, y, frame, color):
-    """Draw player spaceship with animated engine glow."""
-    cx   = x + SHIP_WIDTH  // 2
-    by_  = y + SHIP_HEIGHT
+    cx  = x + SHIP_WIDTH  // 2
+    by_ = y + SHIP_HEIGHT
 
-    # Engine exhaust glow (animated)
+    # Engine glow
     glow_size = 6 + int(4 * math.sin(frame * 0.3))
     glow_surf = pygame.Surface((glow_size * 2, glow_size * 2), pygame.SRCALPHA)
     pygame.draw.circle(glow_surf, (*ORANGE, 120), (glow_size, glow_size), glow_size)
     surf.blit(glow_surf, (cx - glow_size, by_ - glow_size // 2))
 
-    # Exhaust flame
+    # Flame
     flame_h = 10 + int(5 * math.sin(frame * 0.4))
-    pygame.draw.polygon(surf, ORANGE,
-                        [(cx, by_ + flame_h), (cx - 6, by_), (cx + 6, by_)])
-    pygame.draw.polygon(surf, YELLOW,
-                        [(cx, by_ + flame_h - 3), (cx - 3, by_), (cx + 3, by_)])
+    pygame.draw.polygon(surf, ORANGE, [(cx, by_ + flame_h), (cx - 6, by_), (cx + 6, by_)])
+    pygame.draw.polygon(surf, YELLOW, [(cx, by_ + flame_h - 3), (cx - 3, by_), (cx + 3, by_)])
 
-    # Main hull — triangle
-    tip = (cx, y)
-    bl  = (x, by_)
-    br  = (x + SHIP_WIDTH, by_)
+    # Hull
+    tip, bl, br = (cx, y), (x, by_), (x + SHIP_WIDTH, by_)
     pygame.draw.polygon(surf, color, [tip, bl, br])
     pygame.draw.polygon(surf, WHITE,  [tip, bl, br], 2)
 
-    # Cockpit dome
+    # Cockpit
     dome_r = SHIP_WIDTH // 6
     pygame.draw.circle(surf, WHITE, (cx, y + SHIP_HEIGHT // 2), dome_r)
     pygame.draw.circle(surf, color, (cx, y + SHIP_HEIGHT // 2), dome_r - 2)
@@ -464,42 +523,30 @@ def draw_ship(surf, x, y, frame, color):
 
 
 def draw_enemy(surf, x, y):
-    """Draw a classic alien invader sprite."""
     cx = int(x + ENEMY_WIDTH  // 2)
     cy = int(y + ENEMY_HEIGHT // 2)
-
-    # Body (hexagon-ish)
     body_pts = [
-        (cx - 10, y),
-        (cx + 10, y),
+        (cx - 10, y), (cx + 10, y),
         (cx + ENEMY_WIDTH // 2, cy),
-        (cx + 10, y + ENEMY_HEIGHT),
-        (cx - 10, y + ENEMY_HEIGHT),
+        (cx + 10, y + ENEMY_HEIGHT), (cx - 10, y + ENEMY_HEIGHT),
         (cx - ENEMY_WIDTH // 2, cy),
     ]
     pygame.draw.polygon(surf, (0, 200, 80), body_pts)
     pygame.draw.polygon(surf, (0, 255, 120), body_pts, 2)
-
-    # Eyes
     pygame.draw.circle(surf, RED, (cx - 8, cy - 4), 5)
     pygame.draw.circle(surf, RED, (cx + 8, cy - 4), 5)
     pygame.draw.circle(surf, (255, 100, 100), (cx - 8, cy - 4), 2)
     pygame.draw.circle(surf, (255, 100, 100), (cx + 8, cy - 4), 2)
-
-    # Antennae
     pygame.draw.line(surf, (0, 200, 80), (cx - 8, y),  (cx - 14, y - 10), 2)
     pygame.draw.line(surf, (0, 200, 80), (cx + 8, y),  (cx + 14, y - 10), 2)
     pygame.draw.circle(surf, YELLOW, (cx - 14, y - 10), 3)
     pygame.draw.circle(surf, YELLOW, (cx + 14, y - 10), 3)
-
-    # Mouth / grill lines
     for k in range(3):
         lx = cx - 8 + k * 8
         pygame.draw.line(surf, (0, 150, 50), (lx, cy + 4), (lx, cy + 10), 2)
 
 
 def draw_explosion(surf, cx, cy, t):
-    """Animated particle burst explosion."""
     num_particles = 14
     for k in range(num_particles):
         angle  = 2 * math.pi * k / num_particles + t * 0.1
@@ -511,8 +558,6 @@ def draw_explosion(surf, cx, cy, t):
         color  = (heat, max(0, heat - 80), 0)
         if 0 <= px < WINDOW_WIDTH and 0 <= py < WINDOW_HEIGHT:
             pygame.draw.circle(surf, color, (px, py), radius)
-
-    # Core flash
     if t > 10:
         core_r = (t - 10) * 2
         flash  = pygame.Surface((core_r * 2, core_r * 2), pygame.SRCALPHA)
@@ -526,19 +571,17 @@ def _draw_bullet_trail(surf, bullet, player_color):
     if n < 2:
         return
     for k in range(n - 1):
-        ratio   = k / n
-        r       = min(255, int(player_color[0] * ratio + 255 * (1 - ratio)))
-        g       = min(255, int(player_color[1] * ratio))
-        b       = min(255, int(player_color[2] * ratio))
-        w_px    = max(1, int(BULLET_RADIUS * ratio))
+        ratio = k / n
+        r     = min(255, int(player_color[0] * ratio + 255 * (1 - ratio)))
+        g     = min(255, int(player_color[1] * ratio))
+        b     = min(255, int(player_color[2] * ratio))
+        w_px  = max(1, int(BULLET_RADIUS * ratio))
         pygame.draw.line(surf, (r, g, b),
                          (int(trail[k][0]),   int(trail[k][1])),
-                         (int(trail[k+1][0]), int(trail[k+1][1])),
-                         w_px)
+                         (int(trail[k+1][0]), int(trail[k+1][1])), w_px)
 
 
 def _draw_enemy_overlay(surf, en):
-    """Draw coloured ring around fast/tank enemies."""
     _, _, ring_color, _ = ENEMY_TYPES[en['type']]
     if ring_color is None:
         return
@@ -558,7 +601,6 @@ def _draw_score_popups(surf, popups, popup_font):
 
 
 def _draw_ghost_ship(surf, x, color):
-    """Draw a semi-transparent ship outline for inactive players."""
     ghost = pygame.Surface((SHIP_WIDTH, SHIP_HEIGHT), pygame.SRCALPHA)
     cx    = SHIP_WIDTH // 2
     pts   = [(cx, 0), (0, SHIP_HEIGHT), (SHIP_WIDTH, SHIP_HEIGHT)]
@@ -567,27 +609,52 @@ def _draw_ghost_ship(surf, x, color):
     surf.blit(ghost, (x, WINDOW_HEIGHT - SHIP_HEIGHT))
 
 
-def _draw_hud(surf, scores, high_score, t_left, frame, active_players):
-    """Draw all heads-up display elements."""
+def _draw_hud(surf, scores, high_score, t_left, frame, active_players,
+              user_data=None, hailo_ok=False):
     # Player scores
     for i, score in enumerate(scores):
-        status = "" if active_players[i] else " (away)"
-        draw_text(surf, f"P{i+1}: {score}{status}", 10, 10 + i * 32, PLAYER_COLORS[i])
+        label = f"P{i+1}: {score}" + ("" if active_players[i] else " (away)")
+        draw_text(surf, label, 10, 10 + i * 32, PLAYER_COLORS[i])
 
     # High score
     draw_text(surf, f"BEST: {high_score}", 10, 10 + MAX_PLAYERS * 32 + 8, WHITE)
 
-    # Timer — flash red when low
+    # Timer
     if t_left <= LOW_TIME_THRESHOLD and frame % 20 < 10:
         timer_col = (255, 50, 50)
     else:
         timer_col = WHITE
     draw_text(surf, f"TIME: {t_left:02d}", WINDOW_WIDTH - 160, 10, timer_col)
 
-    # Active player indicator dots
+    # Active player dots
     for i in range(MAX_PLAYERS):
         dot_col = PLAYER_COLORS[i] if active_players[i] else (60, 60, 60)
         pygame.draw.circle(surf, dot_col, (WINDOW_WIDTH - 20, 20 + i * 18), 6)
+
+    # Camera diagnostics (bottom-left, only when Hailo is running)
+    if hailo_ok and user_data is not None:
+        cam_label = (
+            f"CAM  {user_data.camera_fps:.0f} fps  |  "
+            f"{user_data.detections_last_frame} person(s) detected  |  "
+            f"src: {INPUT_SOURCE}"
+        )
+        draw_text(surf, cam_label, 8, WINDOW_HEIGHT - 24, (150, 150, 180), 20)
+
+
+def _draw_pose_debug(surf, active_players, ship_positions):
+    """
+    Draw a thin position bar at the bottom of the screen so players
+    can see their detected position even before a ship is active.
+    """
+    bar_y  = WINDOW_HEIGHT - SHIP_HEIGHT - 12
+    bar_h  = 4
+    for i in range(MAX_PLAYERS):
+        col     = PLAYER_COLORS[i]
+        ship_cx = ship_positions[i] + SHIP_WIDTH // 2
+        # Draw a small triangle marker above the bar
+        pts = [(ship_cx, bar_y - 6), (ship_cx - 5, bar_y), (ship_cx + 5, bar_y)]
+        alpha_col = tuple(max(0, c - 80) for c in col) if not active_players[i] else col
+        pygame.draw.polygon(surf, alpha_col, pts)
 
 
 # =============================================================================
@@ -613,19 +680,24 @@ def main():
     bullet_outer_colors = [tuple(min(255, c + 80) for c in col) for col in PLAYER_COLORS]
 
     # Game state
-    ship_positions     = [WINDOW_WIDTH // (MAX_PLAYERS + 1) * (i + 1) for i in range(MAX_PLAYERS)]
+    # ship_positions stored as pixel X of left edge of ship
+    default_xs         = [WINDOW_WIDTH // (MAX_PLAYERS + 1) * (i + 1)
+                          for i in range(MAX_PLAYERS)]
+    # position_histories stores normalised 0–1 values
     position_histories = [
-        deque([ship_positions[i]] * SMOOTHING_WINDOW, maxlen=SMOOTHING_WINDOW)
+        deque([default_xs[i] / WINDOW_WIDTH] * SMOOTHING_WINDOW,
+              maxlen=SMOOTHING_WINDOW)
         for i in range(MAX_PLAYERS)
     ]
-    bullets        = [[] for _ in range(MAX_PLAYERS)]
-    enemies        = []
-    explosions     = []
-    fireworks      = []
-    score_popups   = []
-    scores         = [0] * MAX_PLAYERS
-    high_score     = load_high_score()
-    shoot_cooldowns= [0] * MAX_PLAYERS
+    ship_positions     = list(default_xs)
+    bullets            = [[] for _ in range(MAX_PLAYERS)]
+    enemies            = []
+    explosions         = []
+    fireworks          = []
+    score_popups       = []
+    scores             = [0] * MAX_PLAYERS
+    high_score         = load_high_score()
+    shoot_cooldowns    = [0] * MAX_PLAYERS
 
     start_time       = time.time()
     frame            = 0
@@ -638,43 +710,41 @@ def main():
     # CAMERA + POSE ESTIMATION STARTUP
     # ------------------------------------------------------------------
     user_data = PoseInvadersUserData()
+    _hailo_running = False
 
     if HAILO_AVAILABLE:
-        # 1. Validate the camera device node exists
-        if CAMERA_DEVICE and not _check_camera_device(CAMERA_DEVICE):
-            print("[WARN] Camera device missing — switching to keyboard fallback.")
-            _hailo_ok = False
+        if CAMERA_DEVICE and not os.path.exists(CAMERA_DEVICE):
+            print(f"[ERROR] Camera device not found: {CAMERA_DEVICE}")
+            print( "        Run: ls /dev/video*")
+            print( "[INFO]  Falling back to keyboard control.")
         else:
-            _hailo_ok = True
-
-        if _hailo_ok:
-            # 2. GLib main loop — MUST start before app.run() so the
-            #    GStreamer pipeline bus has an event dispatcher ready
+            # 1. GLib main loop must be running before the pipeline starts
             glib_thread = threading.Thread(
                 target=_start_glib_loop, daemon=True, name='GLib-Loop'
             )
             glib_thread.start()
-            time.sleep(0.1)   # give GLib loop time to spin up
+            time.sleep(0.15)   # give GLib time to spin up
 
-            # 3. Build and start the pose pipeline
+            # 2. Build and start the pose pipeline in its own thread
             def _run_pose_app():
                 try:
-                    callback = PoseInvadersCallback(user_data)
-                    app      = GStreamerPoseEstimationApp(callback, user_data)
+                    cb  = PoseInvadersCallback(user_data)
+                    app = GStreamerPoseEstimationApp(cb, user_data)
                     app.run()
                 except Exception as exc:
                     print(f"[ERROR] Pose pipeline crashed: {exc}")
-                    print("[INFO]  Continuing in keyboard fallback mode.")
+                    print( "[INFO]  Falling back to keyboard control.")
 
             pose_thread = threading.Thread(
                 target=_run_pose_app, daemon=True, name='Pose-Pipeline'
             )
             pose_thread.start()
-            print("[INFO] Camera pipeline starting…  "
-                  "(first frame may take 2–3 s)")
+            _hailo_running = True
+            print("[INFO] Camera pipeline starting…  (first frame may take 2–3 s)")
+            print("[INFO] Control: move your BODY left/right in front of the camera.")
     else:
-        print("[INFO] Keyboard / mouse fallback active.")
-        print("       P1: A / D keys    P2: LEFT / RIGHT keys")
+        print("[INFO] Keyboard fallback active.")
+        print("       P1: A / D    P2: LEFT / RIGHT")
 
     BGM_RESTART_EVENT = pygame.USEREVENT + 1
 
@@ -690,17 +760,52 @@ def main():
                 start_bgm()
 
         # ----------------------------------------------------------------
-        # KEYBOARD FALLBACK (A/D — P1,  ←/→ — P2)
+        # KEYBOARD FALLBACK  (always checked — allows hybrid control)
         # ----------------------------------------------------------------
         keys = pygame.key.get_pressed()
         kb   = [(pygame.K_a, pygame.K_d), (pygame.K_LEFT, pygame.K_RIGHT)]
         for i, (kl, kr) in enumerate(kb):
             if i >= MAX_PLAYERS:
                 break
+            moved = False
             if keys[kl]:
-                position_histories[i].append(max(0, position_histories[i][-1] - 8))
+                new_xn = max(0.0, position_histories[i][-1] - 8.0 / WINDOW_WIDTH)
+                position_histories[i].append(new_xn)
+                moved = True
             elif keys[kr]:
-                position_histories[i].append(min(WINDOW_WIDTH - SHIP_WIDTH, position_histories[i][-1] + 8))
+                new_xn = min(1.0, position_histories[i][-1] + 8.0 / WINDOW_WIDTH)
+                position_histories[i].append(new_xn)
+                moved = True
+            # In keyboard-only mode mark player as active once a key is pressed
+            if moved and not _hailo_running:
+                user_data.set_active(i, True)
+
+        # ----------------------------------------------------------------
+        # READ POSE POSITIONS FROM HAILO
+        # Each player's position arrives as a normalised 0–1 float.
+        # ----------------------------------------------------------------
+        if _hailo_running:
+            for i in range(MAX_PLAYERS):
+                xn = user_data.get_position(i)
+                if xn is not None:
+                    position_histories[i].append(xn)
+
+        # Compute smoothed pixel positions
+        ship_positions = [
+            int(np.clip(
+                (sum(hist) / len(hist)) * WINDOW_WIDTH - SHIP_WIDTH // 2,
+                0, WINDOW_WIDTH - SHIP_WIDTH
+            ))
+            for hist in position_histories
+        ]
+
+        # ----------------------------------------------------------------
+        # ACTIVE PLAYER FLAGS
+        # ----------------------------------------------------------------
+        active_players = (
+            user_data.active_players if _hailo_running
+            else [True] * MAX_PLAYERS
+        )
 
         # ----------------------------------------------------------------
         # TIMING
@@ -715,8 +820,8 @@ def main():
             explosions.append({'x': WINDOW_WIDTH / 2, 'y': WINDOW_HEIGHT / 2, 't': 30})
             shake_timer = SHAKE_FRAMES
             sounds['round_end'].play()
-            pygame.mixer.stop()          # stop BGM during fanfare
-            start_bgm()                  # re-queue BGM immediately after
+            pygame.mixer.stop()
+            start_bgm()
             if max(scores) > high_score:
                 high_score = max(scores)
                 save_high_score(high_score)
@@ -737,37 +842,14 @@ def main():
             last_tick_second = t_left
 
         # ----------------------------------------------------------------
-        # READ POSE POSITIONS
-        # ----------------------------------------------------------------
-        for i in range(MAX_PLAYERS):
-            try:
-                hx = user_data.position_queues[i].get_nowait()
-                position_histories[i].append(hx)
-            except queue.Empty:
-                pass
-
-        ship_positions = [
-            int(np.clip(
-                sum(hist) / len(hist) - SHIP_WIDTH // 2,
-                0, WINDOW_WIDTH - SHIP_WIDTH
-            ))
-            for hist in position_histories
-        ]
-
-        # ----------------------------------------------------------------
         # SHOOTING
         # ----------------------------------------------------------------
-        # In fallback mode all players are always considered active
-        active_players = (
-            user_data.active_players if HAILO_AVAILABLE
-            else [True] * MAX_PLAYERS
-        )
         for i in range(MAX_PLAYERS):
             if active_players[i]:
                 shoot_cooldowns[i] -= 1
                 if shoot_cooldowns[i] <= 0:
-                    lx = ship_positions[i] + SHIP_WIDTH  * 0.2
-                    rx = ship_positions[i] + SHIP_WIDTH  * 0.8
+                    lx = ship_positions[i] + SHIP_WIDTH * 0.2
+                    rx = ship_positions[i] + SHIP_WIDTH * 0.8
                     yb = WINDOW_HEIGHT - SHIP_HEIGHT * 0.5
                     bullets[i].append({'x': lx, 'y': yb, 'trail': [], 'color': PLAYER_COLORS[i]})
                     bullets[i].append({'x': rx, 'y': yb, 'trail': [], 'color': PLAYER_COLORS[i]})
@@ -847,9 +929,6 @@ def main():
             if p['t'] <= 0:
                 score_popups.remove(p)
 
-        # ----------------------------------------------------------------
-        # SCREEN SHAKE COUNTDOWN
-        # ----------------------------------------------------------------
         if shake_timer > 0:
             shake_timer -= 1
 
@@ -858,26 +937,24 @@ def main():
         # ================================================================
         draw_background_3d(game_surf, stars3d)
 
-        # Ghost ships (inactive players)
+        # Ghost ships for inactive players
         for i in range(MAX_PLAYERS):
             if not active_players[i]:
                 _draw_ghost_ship(game_surf, ship_positions[i], PLAYER_COLORS[i])
 
-        # Active ships + bullet trails
+        # Active ships + bullets
         for i in range(MAX_PLAYERS):
             if active_players[i]:
                 sy = WINDOW_HEIGHT - SHIP_HEIGHT
                 draw_ship(game_surf, ship_positions[i], sy, frame, PLAYER_COLORS[i])
-                outer = bullet_outer_colors[i]
-                inner = PLAYER_COLORS[i]
                 for b in bullets[i]:
                     _draw_bullet_trail(game_surf, b, PLAYER_COLORS[i])
-                    fh = BULLET_RADIUS * 6
                     bx, by_ = int(b['x']), int(b['y'])
+                    fh = BULLET_RADIUS * 6
                     br = BULLET_RADIUS
-                    pygame.draw.polygon(game_surf, outer,
+                    pygame.draw.polygon(game_surf, bullet_outer_colors[i],
                                         [(bx, by_), (bx - br, by_ + fh), (bx + br, by_ + fh)])
-                    pygame.draw.polygon(game_surf, inner,
+                    pygame.draw.polygon(game_surf, PLAYER_COLORS[i],
                                         [(bx, by_ + int(fh * 0.4)),
                                          (bx - br // 2, by_ + fh),
                                          (bx + br // 2, by_ + fh)])
@@ -893,6 +970,11 @@ def main():
 
         # Score popups
         _draw_score_popups(game_surf, score_popups, popup_font)
+
+        # Pose position debug markers (always visible so players can
+        # see their tracked position even before they're fully active)
+        if _hailo_running:
+            _draw_pose_debug(game_surf, active_players, ship_positions)
 
         # End-of-round banner
         if banner_timer > 0:
@@ -921,25 +1003,25 @@ def main():
             banner_timer -= 1
 
         # HUD
-        _draw_hud(game_surf, scores, high_score, t_left, frame, active_players)
+        _draw_hud(game_surf, scores, high_score, t_left, frame,
+                  active_players, user_data=user_data, hailo_ok=_hailo_running)
 
-        # Apply screen shake
+        # Screen shake
+        sx, sy = 0, 0
         if shake_timer > 0:
             amp = int(SHAKE_AMPLITUDE * shake_timer / SHAKE_FRAMES)
             sx  = random.randint(-amp, amp)
             sy  = random.randint(-amp, amp)
-        else:
-            sx, sy = 0, 0
 
         screen.fill(BLACK)
         screen.blit(game_surf, (sx, sy))
 
-        # Camera warm-up overlay — shown for the first 3 seconds
-        # when Hailo is active so players know the camera is starting
-        if HAILO_AVAILABLE and frame < FPS * 3:
+        # Camera warm-up overlay (first 3 s)
+        if _hailo_running and frame < FPS * 3:
             _font_sm  = pygame.font.SysFont('monospace', 18, bold=True)
             _cam_text = _font_sm.render(
-                f"Camera warming up… ({INPUT_SOURCE})", True, (255, 220, 60)
+                f"Camera warming up… ({INPUT_SOURCE})  —  step in front of the camera",
+                True, (255, 220, 60)
             )
             screen.blit(_cam_text, (10, WINDOW_HEIGHT - 30))
 
