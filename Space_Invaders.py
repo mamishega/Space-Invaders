@@ -11,20 +11,51 @@ import pygame
 import pygame.sndarray
 import random
 import math
-import gi
 import os
 import json
 import numpy as np
 import time
+import sys
 
-import hailo
-from hailo_apps_infra.hailo_rpi_common import (
-    get_caps_from_pad, get_numpy_from_buffer, app_callback_class
-)
-from hailo_apps_infra.pose_estimation_pipeline import GStreamerPoseEstimationApp
+# =============================================================================
+# HAILO / GSTREAMER — optional import
+# If the Hailo environment is not active the game falls back to
+# keyboard + mouse control automatically.
+# =============================================================================
+HAILO_AVAILABLE = False
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst, GLib
 
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+    import hailo
+    from hailo_apps_infra.hailo_rpi_common import (
+        get_caps_from_pad, get_numpy_from_buffer, app_callback_class
+    )
+    from hailo_apps_infra.pose_estimation_pipeline import GStreamerPoseEstimationApp
+    HAILO_AVAILABLE = True
+    print("[INFO] Hailo AI HAT+ detected — pose estimation enabled.")
+
+except Exception as _hailo_err:
+    print(f"[WARN] Hailo / hailo_apps_infra not found: {_hailo_err}")
+    print("[INFO] Running in KEYBOARD / MOUSE fallback mode.")
+    print("[INFO] To enable Hailo:  source ~/hailo-rpi5-examples/setup_env.sh")
+
+    # ------------------------------------------------------------------
+    # Minimal stub classes so the rest of the file imports without error
+    # ------------------------------------------------------------------
+    class app_callback_class:          # noqa: N801
+        pass
+
+    class _FakeGStreamerApp:
+        def run(self): pass
+
+    def GStreamerPoseEstimationApp(cb, ud):
+        return _FakeGStreamerApp()
+
+    class Gst:
+        class PadProbeReturn:
+            OK = 0
 
 # =============================================================================
 # CONSTANTS
@@ -166,6 +197,9 @@ class PoseInvadersCallback(app_callback_class):
         self.user_data = user_data
 
     def __call__(self, pad, info, u_data):
+        if not HAILO_AVAILABLE:
+            return Gst.PadProbeReturn.OK
+
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
@@ -530,12 +564,17 @@ def main():
     shake_timer      = 0
     last_tick_second = -1
 
-    # Start pose estimation thread
-    user_data   = PoseInvadersUserData()
-    callback    = PoseInvadersCallback(user_data)
-    app         = GStreamerPoseEstimationApp(callback, user_data)
-    pose_thread = threading.Thread(target=app.run, daemon=True)
-    pose_thread.start()
+    # Start pose estimation thread (only when Hailo hardware is present)
+    user_data = PoseInvadersUserData()
+    if HAILO_AVAILABLE:
+        callback    = PoseInvadersCallback(user_data)
+        app         = GStreamerPoseEstimationApp(callback, user_data)
+        pose_thread = threading.Thread(target=app.run, daemon=True)
+        pose_thread.start()
+        print("[INFO] Pose estimation thread started.")
+    else:
+        print("[INFO] Keyboard / mouse fallback active.")
+        print("       P1: A / D keys    P2: LEFT / RIGHT keys")
 
     BGM_RESTART_EVENT = pygame.USEREVENT + 1
 
@@ -618,7 +657,11 @@ def main():
         # ----------------------------------------------------------------
         # SHOOTING
         # ----------------------------------------------------------------
-        active_players = user_data.active_players
+        # In fallback mode all players are always considered active
+        active_players = (
+            user_data.active_players if HAILO_AVAILABLE
+            else [True] * MAX_PLAYERS
+        )
         for i in range(MAX_PLAYERS):
             if active_players[i]:
                 shoot_cooldowns[i] -= 1
